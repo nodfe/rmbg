@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use ndarray::Array;
-use ort::{inputs, CUDAExecutionProvider, Session};
-use std::{fs, ops::Mul, path};
+use ort::{execution_providers::CUDAExecutionProvider, session::Session, value::Value};
+use std::{fs, path};
 use tauri::api::path::download_dir;
 
 fn get_unique_file_path<P: AsRef<path::Path>>(path: P) -> Result<path::PathBuf> {
@@ -49,16 +49,20 @@ pub fn process_image(input: &str, model: &str, resolution: u32) -> Result<String
         .with_execution_providers([CUDAExecutionProvider::default().build()])
         .commit()?;
 
-    let model =
+    let mut model =
         Session::builder()?.commit_from_file(model)?;
-    let model_input = &model
+    let model_input_name = model
         .inputs
         .get(0)
-        .ok_or_else(|| anyhow!("Failed to get input info!"))?;
-    let model_output = &model
+        .ok_or_else(|| anyhow!("Failed to get input info!"))?
+        .name
+        .clone();
+    let model_output_name = model
         .outputs
         .get(0)
-        .ok_or_else(|| anyhow!("Failed to get output info!"))?;
+        .ok_or_else(|| anyhow!("Failed to get output info!"))?
+        .name
+        .clone();
 
     let model_width = resolution;
     let model_height = resolution;
@@ -77,11 +81,11 @@ pub fn process_image(input: &str, model: &str, resolution: u32) -> Result<String
         input[[0, 2, y, x]] = (b as f32 - 127.5) / 127.5;
     }
 
-    let outputs = model.run(inputs![&model_input.name => input.view()]?)?;
-    let output = outputs[model_output.name.as_ref()].try_extract_tensor::<f32>()?;
-    // convert to 8-bit
-    let output = output.mul(255.0).map(|x| *x as u8);
-    let output = output.into_raw_vec();
+    let outputs = model.run(vec![(&model_input_name, Value::from_array((input.shape().to_vec(), input.into_raw_vec()))?)])?;
+    let output = outputs[model_output_name.as_ref()].try_extract_tensor::<f32>()?;
+    // convert to 8-bit - extract the data from the tensor tuple
+    let (_shape, data) = output;
+    let output: Vec<u8> = data.iter().map(|x| (x * 255.0) as u8).collect();
 
     // change rgb to rgba
     let output_img = ImageBuffer::from_fn(model_width, model_height, |x, y| {
@@ -92,10 +96,10 @@ pub fn process_image(input: &str, model: &str, resolution: u32) -> Result<String
         image::imageops::resize(&output_img, img_width, img_height, FilterType::Triangle);
     output_img.enumerate_pixels_mut().for_each(|(x, y, pixel)| {
         let origin = input_file.get_pixel(x, y);
-        pixel.0[3] = pixel.0[0];
-        pixel.0[0] = origin.0[0];
-        pixel.0[1] = origin.0[1];
-        pixel.0[2] = origin.0[2];
+        pixel[3] = pixel[0];
+        pixel[0] = origin[0];
+        pixel[1] = origin[1];
+        pixel[2] = origin[2];
     });
 
     let output_dir = download_dir().ok_or_else(|| anyhow!("Download director not found!"))?;
